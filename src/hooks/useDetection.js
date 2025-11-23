@@ -1,49 +1,94 @@
-// src/hooks/useDetection.js
 import { useRef, useState, useEffect } from "react";
 
-const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+// Pastikan URL Backend benar
+const API_BASE = import.meta.env.VITE_API_BASE || "https://55e0ab796f01.ngrok-free.app";
 const DETECT_URL = `${API_BASE}/detect`;
+
+// --- PENGATURAN KECEPATAN (LIMIT) ---
+const MIN_INTERVAL_MS = 0; 
 
 export function useDetection(videoRef, cameraOn, onDetections) {
   const [fps, setFps] = useState(0);
+  
   const sendingRef = useRef(false);
-  const detectTimerRef = useRef(null);
+  const lastSendTime = useRef(0); 
   const fpsCount = useRef(0);
   const fpsLastT = useRef(performance.now());
+  const animationFrameRef = useRef(null);
 
-  // Helper snapshot
+  // Kita simpan rasio resize di ref agar bisa dipakai saat data balik
+  const resizeScaleRef = useRef(1); 
+
+  // Helper snapshot: OTOMATIS RESIZE KE 640px
   const captureImage = () => {
     const v = videoRef.current;
     if (!v || !v.videoWidth) return null;
+
+    // Target lebar untuk dikirim ke API
+    const targetWidth = 640; 
+    
+    // Hitung Rasio (Misal: 640 / 1280 = 0.5)
+    const scale = targetWidth / v.videoWidth;
+    resizeScaleRef.current = scale; // Simpan rasionya!
+
+    const targetHeight = v.videoHeight * scale;
+
     const cvs = document.createElement("canvas");
-    cvs.width = v.videoWidth;
-    cvs.height = v.videoHeight;
-    cvs.getContext("2d").drawImage(v, 0, 0);
-    return cvs.toDataURL("image/jpeg", 0.75);
+    cvs.width = targetWidth;
+    cvs.height = targetHeight;
+    
+    cvs.getContext("2d").drawImage(v, 0, 0, targetWidth, targetHeight);
+    
+    return cvs.toDataURL("image/jpeg", 0.6); 
   };
 
   // Fungsi Kirim ke API
   const sendDetect = async () => {
-    if (sendingRef.current || !cameraOn) return;
+    const now = performance.now();
+
+    if (!cameraOn || sendingRef.current) return;
+
+    if (now - lastSendTime.current < MIN_INTERVAL_MS) {
+      return; 
+    }
     
     const dataUrl = captureImage();
     if (!dataUrl) return;
 
     sendingRef.current = true;
+    lastSendTime.current = now;
+
     try {
       const res = await fetch(DETECT_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "ngrok-skip-browser-warning": "true",
+        },
         body: JSON.stringify({ image: dataUrl }),
       });
       
       if (res.ok) {
-        const detections = await res.json();
-        if (onDetections) onDetections(detections); // Callback ke parent
+        const rawDetections = await res.json();
+        
+        // --- LOGIKA PERBAIKAN BBOX (UPSCALE) ---
+        // Karena API mendeteksi di gambar kecil (640px),
+        // Kita harus kembalikan koordinatnya ke ukuran asli video (1280px).
+        // Caranya: Bagi koordinat dengan scale tadi. (x / 0.5 = 2x)
+        const scale = resizeScaleRef.current;
+        
+        const scaledDetections = rawDetections.map(d => ({
+          ...d,
+          x1: d.x1 / scale,
+          y1: d.y1 / scale,
+          x2: d.x2 / scale,
+          y2: d.y2 / scale
+        }));
+
+        if (onDetections) onDetections(scaledDetections); 
 
         // Hitung FPS Server
         fpsCount.current++;
-        const now = performance.now();
         if (now - fpsLastT.current >= 1000) {
            setFps(fpsCount.current);
            fpsCount.current = 0;
@@ -57,19 +102,25 @@ export function useDetection(videoRef, cameraOn, onDetections) {
     }
   };
 
-  // Loop Interval
+  // Loop Animation Frame
   useEffect(() => {
+    const loop = () => {
+      if (cameraOn) {
+        sendDetect();
+        animationFrameRef.current = requestAnimationFrame(loop);
+      }
+    };
+
     if (cameraOn) {
-      const loop = () => {
-        sendDetect().finally(() => {
-            detectTimerRef.current = setTimeout(loop, 80); // Interval 80ms
-        });
-      };
       loop();
     } else {
-      clearTimeout(detectTimerRef.current);
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      setFps(0);
     }
-    return () => clearTimeout(detectTimerRef.current);
+
+    return () => {
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    };
   }, [cameraOn]);
 
   return { fps };
